@@ -16,22 +16,27 @@ obj.license = "MIT - https://opensource.org/licenses/MIT"
 
 obj.canvas = nil
 obj.timer = nil
+obj.canvasHeight = 10
+obj.trasparency = 0.8
+obj.fillColorPassed = hs.drawing.color.osx_red
+obj.fillColorToPass = hs.drawing.color.osx_green
+
 
 function obj:init()
     self.canvas = hs.canvas.new({x=0, y=0, w=0, h=0}):show()
     self.canvas:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces)
     self.canvas:level(hs.canvas.windowLevels.status)
-    self.canvas:alpha(0.35)
+    self.canvas:alpha(obj.trasparency)
     self.canvas[1] = {
         type = "rectangle",
         action = "fill",
-        fillColor = hs.drawing.color.osx_red,
+        fillColor = obj.fillColorPassed,
         frame = {x="0%", y="0%", w="0%", h="100%"}
     }
     self.canvas[2] = {
         type = "rectangle",
         action = "fill",
-        fillColor = hs.drawing.color.osx_green,
+        fillColor = obj.fillColorToPass,
         frame = {x="0%", y="0%", w="0%", h="100%"}
     }
 end
@@ -58,9 +63,9 @@ function obj:startFor(minutes)
     if obj.timer then
         canvasCleanup()
     else
-        local mainScreen = hs.screen.mainScreen()
+        local mainScreen = hs.screen.primaryScreen()
         local mainRes = mainScreen:fullFrame()
-        obj.canvas:frame({x=mainRes.x, y=mainRes.h-5, w=mainRes.w, h=5})
+        obj.canvas:frame({x=mainRes.x, y=mainRes.h-obj.canvasHeight, w=mainRes.w, obj.canvasHeight})
         -- Set minimum visual step to 2px (i.e. Make sure every trigger updates 2px on screen at least.)
         local minimumStep = 2
         local secCount = math.ceil(60*minutes)
@@ -109,17 +114,19 @@ end
 function obj:setProgress(progress, notifystr)
     if obj.canvas:frame().h == 0 then
         -- Make the canvas actully visible
-        local mainScreen = hs.screen.mainScreen()
+        local mainScreen = hs.screen.primaryScreen()
         local mainRes = mainScreen:fullFrame()
-        obj.canvas:frame({x=mainRes.x, y=mainRes.h-5, w=mainRes.w, h=5})
+        obj.canvas:frame({x=mainRes.x, y=mainRes.h-obj.canvasHeight, w=mainRes.w, h=obj.canvasHeight})
     end
     if progress >= 1 then
         canvasCleanup()
         if notifystr then
+           message = "Time(" .. notifystr .. " mins) is up!"
+           hs.alert(message)
             hs.notify.new({
-                title = "Time(" .. notifystr .. " mins) is up!",
+                title = message,
                 informativeText = "Now is " .. os.date("%X")
-            }):send()
+            }):soundName("Sonar"):send()
         end
     else
         obj.canvas[1].frame.w = tostring(progress)
