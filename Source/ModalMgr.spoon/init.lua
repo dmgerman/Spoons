@@ -22,7 +22,7 @@ obj.supervisor = nil
 
 -- customize width and height of Cheatsheet
 obj.width_factor = 0.30
-obj.height_factor = 0.30
+obj.height_factor = 0.60
 -- minimum sizes
 obj.min_width = 200
 obj.min_height = 200
@@ -86,7 +86,7 @@ function insertIntoSheet(position, st, row, column, n)
          ypos = tostring(math.floor(h * position / 2)) .. "%"
       else
          -- this one goes to the right
-         textAlign =  obj.alignmentRigthColumn
+         -- textAlign =  obj.alignmentRigthColumn
          xpos = xposRight
          ypos = tostring(math.floor(h * (position-1) / 2)) .. "%"
       end
@@ -94,7 +94,7 @@ function insertIntoSheet(position, st, row, column, n)
       local actualPos
       if position > math.ceil(n / 2) then
          -- this one goes to the right
-         textAlign =  obj.alignmentRightColumn
+         -- textAlign =  obj.alignmentRightColumn
          xpos = xposRight
          actualPos = position - math.ceil(n*1.0/2)
       else
@@ -108,8 +108,8 @@ function insertIntoSheet(position, st, row, column, n)
    obj.which_key[position + 1] = {
       type = "text",
       text = st,
-      textFont = "Courier-Bold",
-      textSize = 16,
+      textFont = "Helvetica",
+      textSize = 20,
       textColor = {hex = "#2390FF", alpha = 1},
       textAlignment = textAlign,
       frame = {
@@ -189,10 +189,10 @@ function obj:activate(idList, trayColor, showKeys)
         local cscreen = hs.screen.mainScreen()
         local cres = cscreen:fullFrame()
         obj.modal_tray:frame({
-            x = cres.w - math.ceil(cres.w / 32),
-            y = cres.h - math.ceil(cres.w / 32),
-            w = math.ceil(cres.w / 32 / 2),
-            h = math.ceil(cres.w / 32 / 2)
+            x = cres.w - math.ceil(cres.w / 8),
+            y = cres.h - math.ceil(cres.w / 8),
+            w = math.ceil(cres.w / 8 / 2),
+            h = math.ceil(cres.w / 8 / 2)
         })
         obj.modal_tray[1].fillColor = {hex = trayColor, alpha = 0.7}
         obj.modal_tray:show()
