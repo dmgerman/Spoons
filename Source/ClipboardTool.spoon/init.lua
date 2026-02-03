@@ -6,13 +6,53 @@
 --- and on [code by VFS](https://github.com/VFS/.hammerspoon/blob/master/tools/clipboard.lua), but with many changes and some contributions and inspiration from [asmagill](https://github.com/asmagill/hammerspoon-config/blob/master/utils/_menus/newClipper.lua).
 ---
 --- Download: [https://github.com/Hammerspoon/Spoons/raw/master/Spoons/ClipboardTool.spoon.zip](https://github.com/Hammerspoon/Spoons/raw/master/Spoons/ClipboardTool.spoon.zip)
+---
+--- ## Password Detection
+---
+--- This spoon includes automatic detection and hiding of password-like entries in the clipboard
+--- history. When enabled (`hide_passwords = true`), sensitive entries are displayed as
+--- `[hidden - N chars]` instead of showing their actual content. The detection uses a 3-step
+--- algorithm to minimize false positives while catching real passwords:
+---
+--- ### Step 1: Allowlist Check (`passNotInAllowlist`)
+--- Immediately allows (does NOT mask) strings matching these patterns:
+--- * UUIDs (e.g., `550e8400-e29b-41d4-a716-446655440000`)
+--- * ULIDs (26 characters, Crockford Base32)
+--- * Hex hashes (exactly 32, 40, or 64 hex characters for MD5/SHA1/SHA256)
+--- * Base64 with padding (length multiple of 4, ends with `=`)
+--- * Pure numbers or decimals
+--- * ISO timestamps/dates (e.g., `2024-01-15`, `2024-01-15T10:30:00Z`)
+--- * IP addresses (IPv4 and IPv6)
+--- * URLs (contains `://`)
+--- * Filenames (contains `/` or ends with `.extension`)
+--- * Strings with more than `password_max_newlines` newlines
+---
+--- ### Step 2: Structural Filter (`passHasStructure`)
+--- Only considers a string as potentially password-like if ALL of:
+--- * Length >= `password_min_length` (default 8)
+--- * Contains no spaces
+--- * Not mostly (>=70%) digits
+--- * Not mostly (>=70%) hex characters
+--- * Contains at least 2 of: lowercase, uppercase, digits, symbols
+---
+--- ### Step 3: Entropy Check (`passHighEntropy`)
+--- Finally applies Shannon entropy threshold:
+--- * Entropy >= `password_entropy_threshold` (default 3.5 bits/char)
+---
+--- Only strings that pass ALL three steps are masked. This approach eliminates most false
+--- positives (URLs, UUIDs, hashes, filenames) while still catching high-entropy passwords.
+---
+--- ### Reveal Controls
+--- While the chooser is open:
+--- * `Cmd-R`: Toggle reveal for the currently selected item only
+--- * `Shift-Cmd-R`: Toggle reveal for ALL password-like items
 
 local obj={}
 obj.__index = obj
 
 -- Metadata
 obj.name = "ClipboardTool"
-obj.version = "0.7"
+obj.version = "0.8"
 obj.author = "Alfred Schilken <alfred@schilken.de>"
 obj.homepage = "https://github.com/Hammerspoon/Spoons"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
@@ -92,6 +132,27 @@ obj.ignoredIdentifiers = {
 --- Whether to remove duplicates from the list, keeping only the latest one. Defaults to `true`.
 obj.deduplicate = true
 
+--- ClipboardTool.hide_passwords
+--- Variable
+--- Whether to hide password-like entries in the chooser display. Defaults to `true`.
+obj.hide_passwords = true
+
+--- ClipboardTool.password_entropy_threshold
+--- Variable
+--- Minimum Shannon entropy (bits per character) to consider a string password-like. Defaults to 3.5.
+--- Only applied after allowlist and structural checks pass.
+obj.password_entropy_threshold = 3.5
+
+--- ClipboardTool.password_min_length
+--- Variable
+--- Minimum length for a string to be considered password-like. Defaults to 8.
+obj.password_min_length = 8
+
+--- ClipboardTool.password_max_newlines
+--- Variable
+--- Maximum number of newlines for a string to be considered password-like. Defaults to 1.
+obj.password_max_newlines = 1
+
 --- ClipboardTool.show_in_menubar
 --- Variable
 --- Whether to show a menubar item to open the clipboard history. Defaults to `true`
@@ -115,9 +176,215 @@ obj.selectorobj = nil
 obj.prevFocusedWindow = nil
 -- Internal variable - Timer object to look for pasteboard changes
 obj.timer = nil
+-- Internal variable - Whether to reveal ALL password-like entries (toggled by Shift-Cmd-R)
+obj.revealPasswords = false
+-- Internal variable - Index of single item to reveal (set by Cmd-R)
+obj.revealedItemIndex = nil
+-- Internal variable - Hotkey for revealing current item (Cmd-R)
+obj.revealCurrentHotkey = nil
+-- Internal variable - Hotkey for revealing all items (Shift-Cmd-R)
+obj.revealAllHotkey = nil
 
 local pasteboard = require("hs.pasteboard") -- http://www.hammerspoon.org/docs/hs.pasteboard.html
 local hashfn   = require("hs.hash").MD5
+
+-- Constants for password detection
+local MOSTLY_THRESHOLD = 0.70  -- 70% threshold for "mostly digits" or "mostly hex"
+local PASSWORD_SYMBOLS = "[!@#$%%%^&*()%-_=+%[%]{}|;:',.<>?/\\`~\"]"
+
+-- Calculate Shannon entropy (bits per character) for a string
+local function calculateEntropy(str)
+   if not str or #str == 0 then return 0 end
+
+   local freq = {}
+   local len = #str
+   for i = 1, len do
+      local char = str:sub(i, i)
+      freq[char] = (freq[char] or 0) + 1
+   end
+
+   local entropy = 0
+   for _, count in pairs(freq) do
+      local p = count / len
+      entropy = entropy - p * math.log(p) / math.log(2)
+   end
+
+   return entropy
+end
+
+-- Step 1: Check if string is NOT in the allowlist (returns true if could be password)
+-- Allowlist includes: UUIDs, ULIDs, hex hashes, Base64, numbers, timestamps, IPs, URLs, filenames
+local function passNotInAllowlist(str, maxNewlines)
+   if not str then return false end
+
+   local len = #str
+
+   -- Check newlines - if too many, it's not a password
+   local newline_count = 0
+   for _ in str:gmatch("\n") do
+      newline_count = newline_count + 1
+   end
+   if newline_count > maxNewlines then
+      return false
+   end
+
+   -- UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+   if str:match("^[0-9a-fA-F]?[0-9a-fA-F]?[0-9a-fA-F]?[0-9a-fA-F]?[0-9a-fA-F]?[0-9a-fA-F]?[0-9a-fA-F]?[0-9a-fA-F]%-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]%-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]%-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]%-[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]$") then
+      return false
+   end
+
+   -- ULID: 26 characters, Crockford Base32 (0-9, A-Z excluding I, L, O, U)
+   if len == 26 and str:match("^[0-9A-HJKMNP-TV-Z]+$") then
+      return false
+   end
+
+   -- Hex hashes: exactly 32 (MD5), 40 (SHA1), or 64 (SHA256) hex characters
+   if (len == 32 or len == 40 or len == 64) and str:match("^[0-9a-fA-F]+$") then
+      return false
+   end
+
+   -- Base64 with padding: ends with = or ==, length multiple of 4, valid chars
+   if len % 4 == 0 and str:match("=+$") and str:match("^[A-Za-z0-9+/]+=*$") then
+      return false
+   end
+
+   -- Pure numbers or decimals (including negative)
+   if str:match("^%-?[0-9]+%.?[0-9]*$") then
+      return false
+   end
+
+   -- ISO timestamps/dates: 2024-01-15, 2024-01-15T10:30:00, etc.
+   if str:match("^%d%d%d%d%-%d%d%-%d%d") then
+      return false
+   end
+
+   -- IPv4 address
+   if str:match("^%d+%.%d+%.%d+%.%d+$") then
+      return false
+   end
+
+   -- IPv6 address (simplified: contains multiple colons and hex)
+   if str:match("^[0-9a-fA-F:]+$") and str:match(":.*:") then
+      return false
+   end
+
+   -- URLs: contains ://
+   if str:match("://") then
+      return false
+   end
+
+   -- Filenames: contains / (path) or ends with .extension
+   if str:match("/") then
+      return false
+   end
+   if str:match("%.[a-zA-Z0-9]+$") and not str:match("%s") then
+      return false
+   end
+
+   -- Not in allowlist - could be a password
+   return true
+end
+
+-- Step 2: Check if string has password-like structure (returns true if could be password)
+-- Requirements: length >= 8, no spaces, not mostly digits, not mostly hex, has 2+ char types
+local function passHasStructure(str, minLength)
+   if not str then return false end
+
+   local len = #str
+
+   -- Length check
+   if len < minLength then
+      return false
+   end
+
+   -- No spaces allowed
+   if str:match("%s") then
+      return false
+   end
+
+   -- Count character types
+   local digitCount = 0
+   local hexCount = 0
+   local hasLower = false
+   local hasUpper = false
+   local hasDigit = false
+   local hasSymbol = false
+
+   for i = 1, len do
+      local char = str:sub(i, i)
+      if char:match("[0-9]") then
+         digitCount = digitCount + 1
+         hexCount = hexCount + 1
+         hasDigit = true
+      elseif char:match("[a-f]") then
+         hexCount = hexCount + 1
+         hasLower = true
+      elseif char:match("[A-F]") then
+         hexCount = hexCount + 1
+         hasUpper = true
+      elseif char:match("[a-z]") then
+         hasLower = true
+      elseif char:match("[A-Z]") then
+         hasUpper = true
+      elseif char:match(PASSWORD_SYMBOLS) then
+         hasSymbol = true
+      end
+   end
+
+   -- Not mostly digits
+   if digitCount / len >= MOSTLY_THRESHOLD then
+      return false
+   end
+
+   -- Not mostly hex
+   if hexCount / len >= MOSTLY_THRESHOLD then
+      return false
+   end
+
+   -- Must have at least 2 character types
+   local charTypes = 0
+   if hasLower then charTypes = charTypes + 1 end
+   if hasUpper then charTypes = charTypes + 1 end
+   if hasDigit then charTypes = charTypes + 1 end
+   if hasSymbol then charTypes = charTypes + 1 end
+
+   if charTypes < 2 then
+      return false
+   end
+
+   -- Passes structural checks - could be a password
+   return true
+end
+
+-- Step 3: Check if string has high entropy (returns true if could be password)
+local function passHighEntropy(str, threshold)
+   if not str then return false end
+   local entropy = calculateEntropy(str)
+   return entropy >= threshold
+end
+
+-- Main function: Check if a string looks like a password using 3-step detection
+local function looksLikePassword(str, settings)
+   if not str then return false end
+
+   -- Step 1: Check allowlist (UUIDs, URLs, hashes, etc.)
+   if not passNotInAllowlist(str, settings.max_newlines) then
+      return false
+   end
+
+   -- Step 2: Check structural requirements
+   if not passHasStructure(str, settings.min_length) then
+      return false
+   end
+
+   -- Step 3: Check entropy threshold
+   if not passHighEntropy(str, settings.entropy_threshold) then
+      return false
+   end
+
+   -- Passes all checks - likely a password
+   return true
+end
 
 -- Keep track of last change counter
 local last_change = nil;
@@ -145,8 +412,58 @@ function obj:toggleMaxSize()
    hs.notify.show("ClipboardTool", "Max Size is now " .. (self.max_size and "enabled" or "disabled"), "")
 end
 
+--- ClipboardTool:revealCurrentPassword()
+--- Method
+--- Reveal only the currently selected password-like entry (bound to Cmd-R)
+---
+--- Parameters:
+---  * None
+function obj:revealCurrentPassword()
+   if self.selectorobj then
+      local currentRow = self.selectorobj:selectedRow()
+      if currentRow and currentRow > 0 then
+         -- Toggle: if already revealing this row, hide it; otherwise reveal it
+         if self.revealedItemIndex == currentRow then
+            self.revealedItemIndex = nil
+         else
+            self.revealedItemIndex = currentRow
+         end
+         self.selectorobj:refreshChoicesCallback()
+         self.selectorobj:selectedRow(currentRow)
+      end
+   end
+end
+
+--- ClipboardTool:toggleRevealAllPasswords()
+--- Method
+--- Toggle revealing of ALL password-like entries in the chooser (bound to Shift-Cmd-R)
+---
+--- Parameters:
+---  * None
+function obj:toggleRevealAllPasswords()
+   self.revealPasswords = not self.revealPasswords
+   self.revealedItemIndex = nil  -- Clear single-item reveal when toggling all
+   if self.selectorobj then
+      local currentRow = self.selectorobj:selectedRow()
+      self.selectorobj:refreshChoicesCallback()
+      if currentRow and currentRow > 0 then
+         self.selectorobj:selectedRow(currentRow)
+      end
+   end
+end
+
 -- Internal method - process the selected item from the chooser. An item may invoke special actions, defined in the `actions` variable.
 function obj:_processSelectedItem(value)
+   -- Disable reveal hotkeys and reset reveal state when chooser closes
+   if self.revealCurrentHotkey then
+      self.revealCurrentHotkey:disable()
+   end
+   if self.revealAllHotkey then
+      self.revealAllHotkey:disable()
+   end
+   self.revealPasswords = false
+   self.revealedItemIndex = nil
+
    local actions = {
       none = function() end,
       clear = hs.fnutils.partial(self.clearAll, self),
@@ -162,7 +479,7 @@ function obj:_processSelectedItem(value)
       elseif value.text then
          if value.type == "text" then
             pasteboard.setContents(value.data)
-         elseif value.type == "image" then 
+         elseif value.type == "image" then
             pasteboard.writeObjects(hs.image.imageFromURL(value.data))
          end
 --         self:pasteboardToClipboard(value.text)
@@ -303,11 +620,27 @@ end
 function obj:_populateChooser(query)
    query = query:lower()
    menuData = {}
+   local passwordSettings = {
+      entropy_threshold = self.password_entropy_threshold,
+      min_length = self.password_min_length,
+      max_newlines = self.password_max_newlines,
+   }
    for k,v in pairs(clipboard_history) do
       if (v.type == "text" and (query == "" or v.content:lower():find(query))) then
-         table.insert(menuData, { text = string.sub(v.content, 0, obj.display_max_length),
+         local displayText = string.sub(v.content, 0, obj.display_max_length)
+         local isPasswordLike = self.hide_passwords and looksLikePassword(v.content, passwordSettings)
+         local rowIndex = #menuData + 1  -- This item's position in the chooser
+
+         -- Hide if password-like, unless revealing all OR revealing this specific item
+         local shouldReveal = self.revealPasswords or (self.revealedItemIndex == rowIndex)
+         if isPasswordLike and not shouldReveal then
+            displayText = "[hidden - " .. #v.content .. " chars]"
+         end
+
+         table.insert(menuData, { text = displayText,
                                   data = v.content,
-                                  type = v.type})
+                                  type = v.type,
+                                  isPasswordLike = isPasswordLike})
       elseif (v.type == "image") then
          table.insert(menuData, { text = "《Image data》",
                                   type = v.type,
@@ -439,6 +772,15 @@ function obj:start()
       self.selectorobj:choices(hs.fnutils.partial(self._populateChooser, self, query))
    end)
    self.selectorobj:rightClickCallback(hs.fnutils.partial(self._showContextMenu, self))
+   -- Create hotkeys for password reveal (disabled by default, enabled when chooser is shown)
+   -- Cmd-R: reveal only the currently selected item
+   self.revealCurrentHotkey = hs.hotkey.new({"cmd"}, "r", function()
+      self:revealCurrentPassword()
+   end)
+   -- Shift-Cmd-R: toggle reveal ALL password-like items
+   self.revealAllHotkey = hs.hotkey.new({"cmd", "shift"}, "r", function()
+      self:toggleRevealAllPasswords()
+   end)
    --Checks for changes on the pasteboard. Is it possible to replace with eventtap?
    self.timer = hs.timer.new(self.frequency, hs.fnutils.partial(self.checkAndStorePasteboard, self))
    self.timer:start()
@@ -459,6 +801,13 @@ function obj:showClipboard()
    if self.selectorobj ~= nil then
       self.selectorobj:refreshChoicesCallback()
       self.prevFocusedWindow = hs.window.focusedWindow()
+      -- Enable reveal hotkeys while chooser is visible
+      if self.revealCurrentHotkey then
+         self.revealCurrentHotkey:enable()
+      end
+      if self.revealAllHotkey then
+         self.revealAllHotkey:enable()
+      end
       self.selectorobj:show()
    else
       hs.notify.show("ClipboardTool not properly initialized", "Did you call ClipboardTool:start()?", "")
@@ -474,6 +823,15 @@ end
 function obj:toggleClipboard()
    if self.selectorobj:isVisible() then
       self.selectorobj:hide()
+      -- Disable reveal hotkeys and reset reveal state when hiding
+      if self.revealCurrentHotkey then
+         self.revealCurrentHotkey:disable()
+      end
+      if self.revealAllHotkey then
+         self.revealAllHotkey:disable()
+      end
+      self.revealPasswords = false
+      self.revealedItemIndex = nil
    else
       self:showClipboard()
    end
